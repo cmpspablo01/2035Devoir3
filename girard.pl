@@ -18,7 +18,7 @@ notmember(Elem, [Head|Rest]) :-
 %   La paire `Key-Value` est l'un des éléments du dictionnaire `Assoc`,
 %   représenté comme une liste de paires.
 
-assoc_key_value([], _Key, _Value) :- fail.
+assoc_key_value([], _, _) :- fail.
 assoc_key_value([First-Second|Rest], Key, Value) :-
     if_(Key = First,
         Value = Second,
@@ -26,6 +26,8 @@ assoc_key_value([First-Second|Rest], Key, Value) :-
 
 %%%
 % name_fresh_vars(Name, Fresh, Vars):
+%   `Fresh` est un nom de variable qui n'est pas présent dans la liste de noms `Vars`
+%   et qui est obtenu à partir du nom original `Name`.
 
 name_fresh_vars(Name, Fresh, Vars) :-
     name_prefix(Name, Fresh),
@@ -39,6 +41,11 @@ name_prefix(Name, ['_'|Mid]) :- name_prefix(Name, Mid).
 % TYPAGE %
 %%%%%%%%%%
 
+%%%
+% type_freevars(Type, Vars):
+%   `Vars` contient la liste des noms de variables libres
+%   dans l'expression de type `Type`.
+
 type_freevars(var(Name), [Name]).
 type_freevars(arrow(Left, Right), Vars) :-
     type_freevars(Left, LV),
@@ -48,6 +55,11 @@ type_freevars(forall(TypeVar, Type), Vars) :-
     type_freevars(Type, BodyVars),
     ord_subtract(BodyVars, [TypeVar], Vars).
 
+%%%
+% env_type(TypeVarEnv, Type):
+%   `Type` est une expression de type bien formée dans l'environnement
+%   `TypeVarEnv` (une liste de noms de variables de types)
+
 env_type(TypeVarEnv, var(Name)) :-
     member(Name, TypeVarEnv).
 env_type(TypeVarEnv, arrow(Left, Right)) :-
@@ -56,23 +68,14 @@ env_type(TypeVarEnv, arrow(Left, Right)) :-
 env_type(TypeVarEnv, forall(TypeVar, Type)) :-
     env_type([TypeVar|TypeVarEnv], Type).
 
-type_rename(var(Name), Old, New, var(NameRen)) :-
-    ( Name = Old -> NameRen = New ; NameRen = Name ).
-type_rename(arrow(Left, Right), Old, New, arrow(LR, RR)) :-
-    type_rename(Left, Old, New, LR),
-    type_rename(Right, Old, New, RR).
-type_rename(forall(TypeVar, Type), Old, New, forall(NewVar, NewType)) :-
-    ( TypeVar = Old ->
-        NewVar = New,
-        type_rename(Type, Old, New, NewType)
-    ;   NewVar = TypeVar,
-        type_rename(Type, Old, New, NewType)
-    ).
+%%%
+% type_subst(Type, Search, Replace, Subst):
+%   `Subst` est l'expression de type obtenue à partir de `Type` en remplaçant chaque
+%   occurrence de `var(Search)` par `Replace`, en faisant de l'α-renommage pour éviter
+%   la capture des variables libres de `Replace`.
 
 type_subst(var(Name), Search, Replace, Subst) :-
-    ( Name = Search -> Subst = Replace
-    ; Subst = var(Name)
-    ).
+    ( Name = Search -> Subst = Replace ; Subst = var(Name) ).
 type_subst(arrow(Left, Right), Search, Replace, arrow(LR, RR)) :-
     type_subst(Left, Search, Replace, LR),
     type_subst(Right, Search, Replace, RR).
@@ -85,14 +88,17 @@ type_subst(forall(TypeVar, Type), Search, Replace, forall(NewVar, NewBody)) :-
             type_freevars(Type, FVType),
             ord_union(FVRep, FVType, Vars),
             name_fresh_vars(TypeVar, Fresh, Vars),
-            type_rename(forall(TypeVar, Type), TypeVar, Fresh,
-                        forall(RenamedVar, RenamedBody))
-        ;   RenamedVar = TypeVar,
-            RenamedBody = Type
-        ),
-        type_subst(RenamedBody, Search, Replace, NewBody),
-        NewVar = RenamedVar
+            type_subst(Type, TypeVar, var(Fresh), RenamedBody),
+            type_subst(RenamedBody, Search, Replace, NewBody),
+            NewVar = Fresh
+        ;   type_subst(Type, Search, Replace, NewBody),
+            NewVar = TypeVar
+        )
     ).
+
+%%%
+% type_equiv(Type1, Type2):
+%   Les types `Type1` et `Type2` sont égaux à un ou plusieurs α-renommage près.
 
 type_equiv(var(X), var(Y)) :- X = Y.
 type_equiv(arrow(A1, B1), arrow(A2, B2)) :-
@@ -103,29 +109,39 @@ type_equiv(forall(TV1, T1), forall(TV2, T2)) :-
     type_freevars(forall(TV2, T2), FV2),
     ord_union(FV1, FV2, Vars),
     name_fresh_vars(TV1, Fresh, Vars),
-    type_rename(T1, TV1, Fresh, RT1),
-    type_rename(T2, TV2, Fresh, RT2),
+    type_subst(T1, TV1, var(Fresh), RT1),
+    type_subst(T2, TV2, var(Fresh), RT2),
     type_equiv(RT1, RT2).
 
-% EVar: lookup d'abord, check ensuite
+%%%
+% env_expr_type(TypeVarEnv, TypeEnv, Expr, Type):
+%   `Expr` est une expression bien formée du type `Type` dans l'environnement
+%   `TypeVarEnv` (une liste de noms de variables de types) et dans l'environnement
+%   `TypeEnv` (un dictionnaire associant chaque variable d'expression à son type).
+
+% EVar
 env_expr_type(TypeVarEnv, TypeEnv, var(Var), Type) :-
     assoc_key_value(TypeEnv, Var, Type),
     env_type(TypeVarEnv, Type).
 
+% Abs
 env_expr_type(TypeVarEnv, TypeEnv, lambda(Var, ArgType, Body),
               arrow(ArgType, BodyType)) :-
     env_type(TypeVarEnv, ArgType),
     env_expr_type(TypeVarEnv, [Var-ArgType|TypeEnv], Body, BodyType).
 
+% App
 env_expr_type(TypeVarEnv, TypeEnv, apply(E1, E2), ResType) :-
     env_expr_type(TypeVarEnv, TypeEnv, E1, arrow(ArgType, ResType)),
     env_expr_type(TypeVarEnv, TypeEnv, E2, ArgType2),
     type_equiv(ArgType, ArgType2).
 
+% Poly
 env_expr_type(TypeVarEnv, TypeEnv, poly(TypeVar, Expr),
               forall(TypeVar, BodyType)) :-
     env_expr_type([TypeVar|TypeVarEnv], TypeEnv, Expr, BodyType).
 
+% Spec
 env_expr_type(TypeVarEnv, TypeEnv, spec(Expr, TypeArg), ResType) :-
     env_expr_type(TypeVarEnv, TypeEnv, Expr, forall(TypeVar, BodyType)),
     env_type(TypeVarEnv, TypeArg),
@@ -134,6 +150,11 @@ env_expr_type(TypeVarEnv, TypeEnv, spec(Expr, TypeArg), ResType) :-
 %%%%%%%%%%%%%%
 % ÉVALUATION %
 %%%%%%%%%%%%%%
+
+%%%
+% expr_freevars(Expr, Vars):
+%   `Vars` contient la liste des noms de variables libres
+%   dans l'expression de valeur `Expr`.
 
 expr_freevars(var(Name), [Name]).
 expr_freevars(lambda(Var, _Type, Body), Vars) :-
@@ -148,56 +169,47 @@ expr_freevars(poly(_TypeVar, Expr), Vars) :-
 expr_freevars(spec(Expr, _Type), Vars) :-
     expr_freevars(Expr, Vars).
 
-expr_rename(var(Name), Old, New, var(NameRen)) :-
-    ( Name = Old -> NameRen = New ; NameRen = Name ).
-expr_rename(lambda(Var, Type, Body), Old, New,
-            lambda(NewVar, Type, NewBody)) :-
-    ( Var = Old ->
-        NewVar = New,
-        expr_rename(Body, Old, New, NewBody)
-    ;   NewVar = Var,
-        expr_rename(Body, Old, New, NewBody)
-    ).
-expr_rename(apply(Left, Right), Old, New, apply(LR, RR)) :-
-    expr_rename(Left, Old, New, LR),
-    expr_rename(Right, Old, New, RR).
-expr_rename(poly(TypeVar, Expr), Old, New, poly(TypeVar, NewExpr)) :-
-    expr_rename(Expr, Old, New, NewExpr).
-expr_rename(spec(Expr, Type), Old, New, spec(NewExpr, Type)) :-
-    expr_rename(Expr, Old, New, NewExpr).
+%%%
+% expr_subst(Expr, Search, Replace, Subst):
+%   `Subst` est l'expression de valeur obtenue à partir de `Expr` en remplaçant chaque
+%   occurrence de `var(Search)` par `Replace`, en faisant de l'α-renommage pour éviter
+%   la capture des variables libres de `Replace`.
 
 expr_subst(var(Name), Search, Replace, Subst) :-
-    ( Name = Search -> Subst = Replace
-    ; Subst = var(Name)
-    ).
+    ( Name = Search -> Subst = Replace ; Subst = var(Name) ).
 expr_subst(apply(Left, Right), Search, Replace, apply(LR, RR)) :-
     expr_subst(Left, Search, Replace, LR),
     expr_subst(Right, Search, Replace, RR).
-expr_subst(poly(TypeVar, Expr), Search, Replace, poly(TypeVar, NewExpr)) :-
-    expr_subst(Expr, Search, Replace, NewExpr).
+expr_subst(poly(TypeVar, Body), Search, Replace, poly(TypeVar, NewBody)) :-
+    expr_subst(Body, Search, Replace, NewBody).
 expr_subst(spec(Expr, Type), Search, Replace, spec(NewExpr, Type)) :-
     expr_subst(Expr, Search, Replace, NewExpr).
-expr_subst(lambda(Var, Type, Body0), Search, Replace,
-           lambda(NewVar, Type, NewBody)) :-
+expr_subst(lambda(Var, Type, Body), Search, Replace, lambda(NewVar, Type, NewBody)) :-
     ( Var = Search ->
         NewVar = Var,
-        NewBody = Body0
+        NewBody = Body
     ;   expr_freevars(Replace, FVRep),
         ( member(Var, FVRep) ->
-            expr_freevars(Body0, FVBody),
+            expr_freevars(Body, FVBody),
             ord_union(FVRep, FVBody, Vars),
             name_fresh_vars(Var, Fresh, Vars),
-            expr_rename(lambda(Var, Type, Body0), Var, Fresh,
-                        lambda(RenVar, Type, RenBody))
-        ;   RenVar = Var,
-            RenBody = Body0
-        ),
-        expr_subst(RenBody, Search, Replace, NewBody),
-        NewVar = RenVar
+            expr_subst(Body, Var, var(Fresh), RenamedBody),
+            expr_subst(RenamedBody, Search, Replace, NewBody),
+            NewVar = Fresh
+        ;   expr_subst(Body, Search, Replace, NewBody),
+            NewVar = Var
+        )
     ).
+
+%%%
+% env_expr_reduce(ValueEnv, Expr, Value)
+%   `Value` est la valeur obtenue en réduisant le plus possible l'expression `Expr`
+%   dans l'environnement `ValueEnv` (un dictionnaire associant chaque variable
+%   d'expression à sa valeur)
 
 env_expr_reduce(ValueEnv, var(Var), Value) :-
     assoc_key_value(ValueEnv, Var, Value), !.
+
 env_expr_reduce(_, var(Var), var(Var)).
 
 env_expr_reduce(ValueEnv, apply(Left, Right), Res) :-
@@ -213,38 +225,34 @@ env_expr_reduce(ValueEnv, apply(Left, Right), Res) :-
         )
     ).
 
-% Réduire à l'intérieur des lambdas (full normalization)
 env_expr_reduce(ValueEnv, lambda(Var, Type, Body), lambda(Var, Type, BodyRed)) :-
     env_expr_reduce(ValueEnv, Body, BodyRed).
-% Effacement des annotations de type à l'exécution (erasure):
-% D'abord réduire le poly, puis réduire le résultat
-env_expr_reduce(ValueEnv, spec(Poly, _), Res) :-
-    env_expr_reduce(ValueEnv, Poly, PolyRed),
-    (PolyRed = poly(_, Body) ->
-        env_expr_reduce(ValueEnv, Body, Res)
-    ;   Res = PolyRed
-    ).
-env_expr_reduce(ValueEnv, poly(_, Body), Res) :-
-    env_expr_reduce(ValueEnv, Body, Res).
+
+env_expr_reduce(ValueEnv, spec(Poly, _), Res) :- env_expr_reduce(ValueEnv, Poly, Res).
+
+env_expr_reduce(ValueEnv, poly(_, Body), Res) :- env_expr_reduce(ValueEnv, Body, Res).
 
 %%%%%%%%%%%
 % SYNTAXE %
 %%%%%%%%%%%
 
-% Scryer: char_type(_, digit) n'existe pas. On accepte lettres unicode (alpha) et chiffres (alnum).
-var_start_char(C) :- char_type(C, alpha) ; char_type(C, alnum) ; C = '_'.
-var_cont_char(C)  :- char_type(C, alpha) ; char_type(C, alnum) ; C = '_'.
+%%%
+% var_ast(var(Name)):
+%   `var(Name)` est une variable.
 
-var_ast(var([C])) --> [C], { var_start_char(C) }.
-var_ast(var([C|Rest])) --> [C], { var_start_char(C) }, var_ast_tail(Rest).
+var_ast(var([Char])) --> [Char], {char_type(Char, alnum)}.
+var_ast(var([Char|Rest])) --> [Char], {char_type(Char, alnum)}, var_ast(var(Rest)).
 
-var_ast_tail([C|Rest]) --> [C], { var_cont_char(C) }, var_ast_tail(Rest).
-var_ast_tail([]) --> [].
+%%%
+% spaces: Suite d'espaces potentiellement vide.
 
-% Consommer espaces et tabulations
 spaces --> [].
 spaces --> " ", spaces.
-spaces --> "\t", spaces.
+
+%%%
+% expr_ast(Ast, Expr, []):
+%   `Expr` est une expression syntaxiquement correcte dont l'arbre
+%   de syntaxe abstrait est `Ast`.
 
 expr_ast(Ast) --> lambda_ast(Ast).
 expr_ast(Ast) --> poly_ast(Ast).
@@ -265,40 +273,38 @@ poly_ast(poly(TypeVar, Body)) -->
     spaces, ".", spaces,
     expr_ast(Body).
 
-% Parser d'application - fonctionne en parsing ET génération
+elem_tree_left(Elem, apply(Left, Right), apply(LeftTr, Right)) :-
+    elem_tree_left(Elem, Left, LeftTr).
+
+elem_tree_left(Elem, spec(Left, Right), spec(LeftTr, Right)) :-
+    elem_tree_left(Elem, Left, LeftTr).
+
+elem_tree_left(Elem, expr(Var), apply(Elem, Var)).
+elem_tree_left(Elem, type(Var), spec(Elem, Var)).
+
 apply_ast(Ast) -->
-    { nonvar(Ast) -> flatten_apply(Ast, Items) ; true },
-    apply_item_ast(First),
-    apply_rest_items(Rest),
-    { Items = [First|Rest], build_apply(Items, Ast) }.
+    {(nonvar(Ast) -> elem_tree_left(Fun, Rest, Ast)); true},
+    apply_item_ast(expr(Fun)), apply_tail_ast(Rest),
+    {elem_tree_left(Fun, Rest, Ast)}.
 
-% Aplatir apply/spec en liste pour la génération
-flatten_apply(apply(L, R), Items) :-
-    flatten_apply(L, LItems),
-    append(LItems, [expr(R)], Items).
-flatten_apply(spec(L, T), Items) :-
-    flatten_apply(L, LItems),
-    append(LItems, [type(T)], Items).
-flatten_apply(Ast, [expr(Ast)]) :-
-    Ast \= apply(_, _), Ast \= spec(_, _).
+apply_tail_ast(Ast) -->
+    {(nonvar(Ast) -> elem_tree_left(Fun, Rest, Ast)); true},
+    " ", spaces, apply_item_ast(Fun), apply_tail_ast(Rest),
+    {elem_tree_left(Fun, Rest, Ast)}.
 
-% Construire l'AST depuis la liste
-build_apply([expr(E)], E).
-build_apply([expr(E), Item | Rest], Ast) :-
-    (Item = expr(R) -> Next = apply(E, R) ; Item = type(T), Next = spec(E, T)),
-    build_apply([expr(Next) | Rest], Ast).
-
-% Parser la suite des items
-apply_rest_items([Item|Rest]) -->
-    " ", spaces, apply_item_ast(Item),
-    apply_rest_items(Rest).
-apply_rest_items([]) --> [].
+apply_tail_ast(Arg) -->
+    " ", spaces, apply_item_ast(Arg).
 
 apply_item_ast(expr(Ast)) --> "(", lambda_ast(Ast), ")".
-apply_item_ast(expr(Ast)) --> "(", poly_ast(Ast), ")".
 apply_item_ast(expr(Ast)) --> "(", apply_ast(Ast), ")".
+apply_item_ast(expr(Ast)) --> "(", poly_ast(Ast), ")".
 apply_item_ast(type(Ast)) --> "[", type_ast(Ast), "]".
 apply_item_ast(expr(Ast)) --> var_ast(Ast).
+
+%%%
+% type_ast(Ast, Expr, []):
+%   `Expr` est une expression de type syntaxiquement correcte dont l'arbre
+%   de syntaxe abstrait est `Ast`.
 
 type_ast(Ast) --> forall_ast(Ast).
 type_ast(Ast) --> arrow_ast(Ast).
@@ -320,121 +326,30 @@ termtype_ast(Ast) --> "(", arrow_ast(Ast), ")".
 termtype_ast(Ast) --> var_ast(Ast).
 
 %%%%%%%%%%%%
-% PRINTER  %
-%%%%%%%%%%%%
-
-% Impression directe des types
-type_to_string(var(Name), Name).
-type_to_string(arrow(L, R), Str) :-
-    type_to_string_atom(L, LS),
-    type_to_string(R, RS),
-    append(LS, "->", T1),
-    append(T1, RS, Str).
-type_to_string(forall(TV, T), Str) :-
-    type_to_string(T, TS),
-    append("forall ", TV, T1),
-    append(T1, ".", T2),
-    append(T2, TS, Str).
-
-type_to_string_atom(var(Name), Name).
-type_to_string_atom(arrow(L, R), Str) :-
-    type_to_string_atom(L, LS),
-    type_to_string(R, RS),
-    append("(", LS, T1),
-    append(T1, "->", T2),
-    append(T2, RS, T3),
-    append(T3, ")", Str).
-type_to_string_atom(forall(TV, T), Str) :-
-    type_to_string(T, TS),
-    append("(forall ", TV, T1),
-    append(T1, ".", T2),
-    append(T2, TS, T3),
-    append(T3, ")", Str).
-
-% Impression directe des expressions
-expr_to_string(var(Name), Name).
-expr_to_string(lambda(V, T, B), Str) :-
-    type_to_string(T, TS),
-    expr_to_string(B, BS),
-    append("lambda ", V, T1),
-    append(T1, ":", T2),
-    append(T2, TS, T3),
-    append(T3, ".", T4),
-    append(T4, BS, Str).
-expr_to_string(poly(TV, B), Str) :-
-    expr_to_string(B, BS),
-    append("poly ", TV, T1),
-    append(T1, ".", T2),
-    append(T2, BS, Str).
-expr_to_string(apply(L, R), Str) :-
-    expr_to_string_app(L, LS),
-    expr_to_string_atom(R, RS),
-    append(LS, " ", T1),
-    append(T1, RS, Str).
-expr_to_string(spec(L, T), Str) :-
-    expr_to_string_app(L, LS),
-    type_to_string(T, TS),
-    append(LS, " [", T1),
-    append(T1, TS, T2),
-    append(T2, "]", Str).
-
-expr_to_string_app(apply(L, R), Str) :-
-    expr_to_string_app(L, LS),
-    expr_to_string_atom(R, RS),
-    append(LS, " ", T1),
-    append(T1, RS, Str).
-expr_to_string_app(spec(L, T), Str) :-
-    expr_to_string_app(L, LS),
-    type_to_string(T, TS),
-    append(LS, " [", T1),
-    append(T1, TS, T2),
-    append(T2, "]", Str).
-expr_to_string_app(E, Str) :-
-    E \= apply(_, _), E \= spec(_, _),
-    expr_to_string_atom(E, Str).
-
-expr_to_string_atom(var(Name), Name).
-expr_to_string_atom(lambda(V, T, B), Str) :-
-    type_to_string(T, TS),
-    expr_to_string(B, BS),
-    append("(lambda ", V, T1),
-    append(T1, ":", T2),
-    append(T2, TS, T3),
-    append(T3, ".", T4),
-    append(T4, BS, T5),
-    append(T5, ")", Str).
-expr_to_string_atom(poly(TV, B), Str) :-
-    expr_to_string(B, BS),
-    append("(poly ", TV, T1),
-    append(T1, ".", T2),
-    append(T2, BS, T3),
-    append(T3, ")", Str).
-expr_to_string_atom(apply(L, R), Str) :-
-    expr_to_string_app(L, LS),
-    expr_to_string_atom(R, RS),
-    append("(", LS, T1),
-    append(T1, " ", T2),
-    append(T2, RS, T3),
-    append(T3, ")", Str).
-expr_to_string_atom(spec(L, T), Str) :-
-    expr_to_string_app(L, LS),
-    type_to_string(T, TS),
-    append("(", LS, T1),
-    append(T1, " [", T2),
-    append(T2, TS, T3),
-    append(T3, "])", Str).
-
-%%%%%%%%%%%%
 % TOPLEVEL %
 %%%%%%%%%%%%
 
+%%%
+% type_ast_print(Type):
+%   Affiche sur la sortie standard une représentation de l'expression de type `Type`
+
 type_ast_print(Type) :-
-    type_to_string(Type, Str), !,
+    type_ast(Type, Str, []), !,
     format("  Type: ~s\n", [Str]).
 
+%%%
+% expr_ast_print(Expr):
+%   Affiche sur la sortie standard une représentation de la valeur `Expr`
+
 expr_ast_print(Expr) :-
-    expr_to_string(Expr, Str), !,
+    expr_ast(Expr, Str, []), !,
     format("Valeur: ~s\n", [Str]).
+
+%%%
+% eval_expr(TypeEnv, ValueEnv, Expr, Type, Value):
+%   Tente de typer et d'évaluer l'expression `Expr` pour obtenir son type `Type` et sa
+%   valeur `Value` dans l'environnement de valeur `ValueEnv` et de type `TypeEnv`. Affiche
+%   le résultat ou l'erreur sur la sortie standard.
 
 eval_expr(TypeEnv, ValueEnv, Expr, Type, Value) :-
     env_expr_type([], TypeEnv, Expr, Type) ->
@@ -445,51 +360,29 @@ eval_expr(TypeEnv, ValueEnv, Expr, Type, Value) :-
         )
   ; format("  Type: [Erreur]\n", []), fail.
 
+%%%
+% assign_name_ast(Name, Expr, Line, []):
+%   Lit une expression de la forme `Name = Expr` dans la chaîne de caractères `Line`.
+
 assign_name_ast(Name, Expr) -->
     var_ast(var(Name)),
     spaces, "=", spaces,
     expr_ast(Expr).
 
-%% --- FIX PRINCIPAL: enlever \n / \r en fin de ligne ---
-strip_eol(Line0, Line) :-
-    ( append(Line1, "\r\n", Line0) -> Line = Line1
-    ; append(Line1, "\n", Line0)   -> Line = Line1
-    ; append(Line1, "\r", Line0)   -> Line = Line1
-    ; Line = Line0
-    ).
+%%%
+% toplevel(TypeEnv, ValueEnv):
+%   Boucle du toplevel avec l'environnement de type `TypeEnv` et de valeur `ValueEnv`.
 
-input_parses(Input) :-
-    once((
-        expr_ast(_, Input, [])
-      ; assign_name_ast(_, _, Input, [])
-    )).
-
-read_command(FirstPrompt, ContPrompt, Input) :-
-    format("~s", [FirstPrompt]),
-    flush_output,
-    get_line_to_chars(user_input, L0, ""),
-    strip_eol(L0, Line0),
-    ( Line0 = "" ->
-        Input = ""
-    ; read_command_more(Line0, ContPrompt, Input)
-    ).
-
-read_command_more(Acc, _ContPrompt, Acc) :-
-    input_parses(Acc), !.
-read_command_more(Acc, ContPrompt, Input) :-
-    format("~s", [ContPrompt]),
-    flush_output,
-    get_line_to_chars(user_input, L1, ""),
-    strip_eol(L1, Line1),
-    ( Line1 = "" ->
-        Input = Acc
-    ; append(Acc, " ", Acc1),
-      append(Acc1, Line1, Acc2),
-      read_command_more(Acc2, ContPrompt, Input)
-    ).
+trim(Line, Trimmed) :- append(Trimmed, "\n", Line), !.
+trim(Line, Trimmed) :- append(Trimmed, "\r\n", Line), !.
+trim(Line, Trimmed) :- append(Trimmed, "\r", Line), !.
+trim(Line, Line).
 
 toplevel(TypeEnv, ValueEnv) :-
-    read_command("> ", "| ", Input),
+    format("> ", []),
+    flush_output,
+    get_line_to_chars(user_input, FullLine, ""),
+    trim(FullLine, Input),
     (
         Input = "" -> halt
       ; (expr_ast(Expr, Input, []),
