@@ -213,10 +213,19 @@ env_expr_reduce(ValueEnv, apply(Left, Right), Res) :-
         )
     ).
 
+% Réduire à l'intérieur des lambdas (full normalization)
 env_expr_reduce(ValueEnv, lambda(Var, Type, Body), lambda(Var, Type, BodyRed)) :-
     env_expr_reduce(ValueEnv, Body, BodyRed).
-env_expr_reduce(ValueEnv, spec(Poly, _), Res) :- env_expr_reduce(ValueEnv, Poly, Res).
-env_expr_reduce(ValueEnv, poly(_, Body), Res) :- env_expr_reduce(ValueEnv, Body, Res).
+% Effacement des annotations de type à l'exécution (erasure):
+% D'abord réduire le poly, puis réduire le résultat
+env_expr_reduce(ValueEnv, spec(Poly, _), Res) :-
+    env_expr_reduce(ValueEnv, Poly, PolyRed),
+    (PolyRed = poly(_, Body) ->
+        env_expr_reduce(ValueEnv, Body, Res)
+    ;   Res = PolyRed
+    ).
+env_expr_reduce(ValueEnv, poly(_, Body), Res) :-
+    env_expr_reduce(ValueEnv, Body, Res).
 
 %%%%%%%%%%%
 % SYNTAXE %
@@ -232,8 +241,10 @@ var_ast(var([C|Rest])) --> [C], { var_start_char(C) }, var_ast_tail(Rest).
 var_ast_tail([C|Rest]) --> [C], { var_cont_char(C) }, var_ast_tail(Rest).
 var_ast_tail([]) --> [].
 
+% Consommer espaces et tabulations
 spaces --> [].
 spaces --> " ", spaces.
+spaces --> "\t", spaces.
 
 expr_ast(Ast) --> lambda_ast(Ast).
 expr_ast(Ast) --> poly_ast(Ast).
@@ -254,28 +265,38 @@ poly_ast(poly(TypeVar, Body)) -->
     spaces, ".", spaces,
     expr_ast(Body).
 
-elem_tree_left(Elem, apply(Left, Right), apply(LeftTr, Right)) :-
-    elem_tree_left(Elem, Left, LeftTr).
-elem_tree_left(Elem, spec(Left, Right), spec(LeftTr, Right)) :-
-    elem_tree_left(Elem, Left, LeftTr).
-elem_tree_left(Elem, expr(Var), apply(Elem, Var)).
-elem_tree_left(Elem, type(Var), spec(Elem, Var)).
-
+% Parser d'application - fonctionne en parsing ET génération
 apply_ast(Ast) -->
-    {(nonvar(Ast) -> elem_tree_left(Fun, Rest, Ast)); true},
-    apply_item_ast(expr(Fun)), apply_tail_ast(Rest),
-    {elem_tree_left(Fun, Rest, Ast)}.
+    { nonvar(Ast) -> flatten_apply(Ast, Items) ; true },
+    apply_item_ast(First),
+    apply_rest_items(Rest),
+    { Items = [First|Rest], build_apply(Items, Ast) }.
 
-apply_tail_ast(Ast) -->
-    {(nonvar(Ast) -> elem_tree_left(Fun, Rest, Ast)); true},
-    " ", spaces, apply_item_ast(Fun), apply_tail_ast(Rest),
-    {elem_tree_left(Fun, Rest, Ast)}.
-apply_tail_ast(Arg) -->
-    " ", spaces, apply_item_ast(Arg).
+% Aplatir apply/spec en liste pour la génération
+flatten_apply(apply(L, R), Items) :-
+    flatten_apply(L, LItems),
+    append(LItems, [expr(R)], Items).
+flatten_apply(spec(L, T), Items) :-
+    flatten_apply(L, LItems),
+    append(LItems, [type(T)], Items).
+flatten_apply(Ast, [expr(Ast)]) :-
+    Ast \= apply(_, _), Ast \= spec(_, _).
+
+% Construire l'AST depuis la liste
+build_apply([expr(E)], E).
+build_apply([expr(E), Item | Rest], Ast) :-
+    (Item = expr(R) -> Next = apply(E, R) ; Item = type(T), Next = spec(E, T)),
+    build_apply([expr(Next) | Rest], Ast).
+
+% Parser la suite des items
+apply_rest_items([Item|Rest]) -->
+    " ", spaces, apply_item_ast(Item),
+    apply_rest_items(Rest).
+apply_rest_items([]) --> [].
 
 apply_item_ast(expr(Ast)) --> "(", lambda_ast(Ast), ")".
-apply_item_ast(expr(Ast)) --> "(", apply_ast(Ast), ")".
 apply_item_ast(expr(Ast)) --> "(", poly_ast(Ast), ")".
+apply_item_ast(expr(Ast)) --> "(", apply_ast(Ast), ")".
 apply_item_ast(type(Ast)) --> "[", type_ast(Ast), "]".
 apply_item_ast(expr(Ast)) --> var_ast(Ast).
 
@@ -299,15 +320,120 @@ termtype_ast(Ast) --> "(", arrow_ast(Ast), ")".
 termtype_ast(Ast) --> var_ast(Ast).
 
 %%%%%%%%%%%%
+% PRINTER  %
+%%%%%%%%%%%%
+
+% Impression directe des types
+type_to_string(var(Name), Name).
+type_to_string(arrow(L, R), Str) :-
+    type_to_string_atom(L, LS),
+    type_to_string(R, RS),
+    append(LS, "->", T1),
+    append(T1, RS, Str).
+type_to_string(forall(TV, T), Str) :-
+    type_to_string(T, TS),
+    append("forall ", TV, T1),
+    append(T1, ".", T2),
+    append(T2, TS, Str).
+
+type_to_string_atom(var(Name), Name).
+type_to_string_atom(arrow(L, R), Str) :-
+    type_to_string_atom(L, LS),
+    type_to_string(R, RS),
+    append("(", LS, T1),
+    append(T1, "->", T2),
+    append(T2, RS, T3),
+    append(T3, ")", Str).
+type_to_string_atom(forall(TV, T), Str) :-
+    type_to_string(T, TS),
+    append("(forall ", TV, T1),
+    append(T1, ".", T2),
+    append(T2, TS, T3),
+    append(T3, ")", Str).
+
+% Impression directe des expressions
+expr_to_string(var(Name), Name).
+expr_to_string(lambda(V, T, B), Str) :-
+    type_to_string(T, TS),
+    expr_to_string(B, BS),
+    append("lambda ", V, T1),
+    append(T1, ":", T2),
+    append(T2, TS, T3),
+    append(T3, ".", T4),
+    append(T4, BS, Str).
+expr_to_string(poly(TV, B), Str) :-
+    expr_to_string(B, BS),
+    append("poly ", TV, T1),
+    append(T1, ".", T2),
+    append(T2, BS, Str).
+expr_to_string(apply(L, R), Str) :-
+    expr_to_string_app(L, LS),
+    expr_to_string_atom(R, RS),
+    append(LS, " ", T1),
+    append(T1, RS, Str).
+expr_to_string(spec(L, T), Str) :-
+    expr_to_string_app(L, LS),
+    type_to_string(T, TS),
+    append(LS, " [", T1),
+    append(T1, TS, T2),
+    append(T2, "]", Str).
+
+expr_to_string_app(apply(L, R), Str) :-
+    expr_to_string_app(L, LS),
+    expr_to_string_atom(R, RS),
+    append(LS, " ", T1),
+    append(T1, RS, Str).
+expr_to_string_app(spec(L, T), Str) :-
+    expr_to_string_app(L, LS),
+    type_to_string(T, TS),
+    append(LS, " [", T1),
+    append(T1, TS, T2),
+    append(T2, "]", Str).
+expr_to_string_app(E, Str) :-
+    E \= apply(_, _), E \= spec(_, _),
+    expr_to_string_atom(E, Str).
+
+expr_to_string_atom(var(Name), Name).
+expr_to_string_atom(lambda(V, T, B), Str) :-
+    type_to_string(T, TS),
+    expr_to_string(B, BS),
+    append("(lambda ", V, T1),
+    append(T1, ":", T2),
+    append(T2, TS, T3),
+    append(T3, ".", T4),
+    append(T4, BS, T5),
+    append(T5, ")", Str).
+expr_to_string_atom(poly(TV, B), Str) :-
+    expr_to_string(B, BS),
+    append("(poly ", TV, T1),
+    append(T1, ".", T2),
+    append(T2, BS, T3),
+    append(T3, ")", Str).
+expr_to_string_atom(apply(L, R), Str) :-
+    expr_to_string_app(L, LS),
+    expr_to_string_atom(R, RS),
+    append("(", LS, T1),
+    append(T1, " ", T2),
+    append(T2, RS, T3),
+    append(T3, ")", Str).
+expr_to_string_atom(spec(L, T), Str) :-
+    expr_to_string_app(L, LS),
+    type_to_string(T, TS),
+    append("(", LS, T1),
+    append(T1, " [", T2),
+    append(T2, TS, T3),
+    append(T3, "])", Str).
+
+%%%%%%%%%%%%
 % TOPLEVEL %
 %%%%%%%%%%%%
 
 type_ast_print(Type) :-
-    type_ast(Type, Str, []), !,
+    type_to_string(Type, Str), !,
     format("  Type: ~s\n", [Str]).
 
 expr_ast_print(Expr) :-
-    expr_ast(Expr, Str, []), !,
+    expr_to_string(Expr, Str), !,
     format("Valeur: ~s\n", [Str]).
 
 eval_expr(TypeEnv, ValueEnv, Expr, Type, Value) :-
